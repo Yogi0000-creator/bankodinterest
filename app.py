@@ -85,15 +85,15 @@ st.markdown("""
         background: linear-gradient(135deg, #2563EB 0%, #1D4ED8 100%) !important;
         color: white !important;
         border: none !important;
-        padding: 12px 24px !important;
-        border-radius: 10px !important;
+        padding: 10px 18px !important;
+        border-radius: 8px !important;
         font-weight: 600 !important;
-        font-size: 15px !important;
-        box-shadow: 0 4px 12px rgba(37, 99, 235, 0.2) !important;
+        font-size: 14px !important;
+        box-shadow: 0 4px 12px rgba(37, 99, 235, 0.15) !important;
         transition: all 0.2s ease !important;
     }
     .stDownloadButton > button:hover {
-        box-shadow: 0 6px 20px rgba(37, 99, 235, 0.35) !important;
+        box-shadow: 0 6px 20px rgba(37, 99, 235, 0.3) !important;
         transform: translateY(-1px);
     }
     
@@ -239,13 +239,15 @@ def format_excel_sheet(workbook, sheet_name):
                     cell.number_format = '₹#,##0.00'
                     cell.alignment = Alignment(horizontal="right")
 
+def convert_df_to_csv(df):
+    return df.to_csv(index=False).encode('utf-8')
+
 # ==================== STREAMLIT UI LAYOUT ====================
 
-# Premium Top Header
 st.markdown("""
     <div class="header-container">
         <div class="header-title">💼 Financial Statement & OD Analytics</div>
-        <div class="header-subtitle">Automated Bank Statement Audit, Interest Computation & Insights Engine</div>
+        <div class="header-subtitle">Automated Bank Statement Audit, Interest Computation & Category-wise Entry Exports</div>
     </div>
 """, unsafe_allow_html=True)
 
@@ -286,19 +288,24 @@ if uploaded_file is not None:
             if filtered_df.empty:
                 st.warning("No transactions found in selected date range.")
             else:
-                # Calculate Metrics
-                total_withdrawal = filtered_df['Withdrawal Amt'].sum()
-                total_deposit = filtered_df['Deposit Amt'].sum()
+                # Prepare Category Dataframes
+                deposits_df = filtered_df[filtered_df['Deposit Amt'] > 0].drop(columns=['Parsed_Date'])
+                withdrawals_df = filtered_df[filtered_df['Withdrawal Amt'] > 0].drop(columns=['Parsed_Date'])
                 
                 cash_mask = filtered_df['Narration'].str.contains(r'CASH|CDM|CSH|DEPOSIT BY CASH', case=False, na=False)
-                total_cash_deposit = filtered_df[cash_mask & (filtered_df['Deposit Amt'] > 0)]['Deposit Amt'].sum()
+                cash_df = filtered_df[cash_mask & (filtered_df['Deposit Amt'] > 0)].drop(columns=['Parsed_Date'])
                 
                 charge_mask = filtered_df['Narration'].str.contains(r'CHARGE|CHG|FEE|INT\.COLL|TAX|GST|COMMISSION|PENALTY', case=False, na=False)
-                total_charges = filtered_df[charge_mask & (filtered_df['Withdrawal Amt'] > 0)]['Withdrawal Amt'].sum()
-                
+                charges_df = filtered_df[charge_mask & (filtered_df['Withdrawal Amt'] > 0)].drop(columns=['Parsed_Date'])
+
+                # Metrics Calculation
+                total_withdrawal = filtered_df['Withdrawal Amt'].sum()
+                total_deposit = filtered_df['Deposit Amt'].sum()
+                total_cash_deposit = cash_df['Deposit Amt'].sum() if not cash_df.empty else 0.0
+                total_charges = charges_df['Withdrawal Amt'].sum() if not charges_df.empty else 0.0
                 total_interest = daily_summary['Daily_Interest'].sum() if not daily_summary.empty else 0.0
 
-                # Custom Styled KPI Cards Row
+                # Metric Cards UI
                 c1, c2, c3, c4, c5 = st.columns(5)
                 
                 c1.markdown(f"""
@@ -307,42 +314,53 @@ if uploaded_file is not None:
                         <div class="metric-value val-credit">₹{total_deposit:,.2f}</div>
                     </div>
                 """, unsafe_allow_html=True)
-                
+                c1.download_button("📥 Export Deposits", convert_df_to_csv(deposits_df), "Deposits_Entries.csv", "text/csv")
+
                 c2.markdown(f"""
                     <div class="metric-card">
                         <div class="metric-label">Total Debits</div>
                         <div class="metric-value val-debit">₹{total_withdrawal:,.2f}</div>
                     </div>
                 """, unsafe_allow_html=True)
-                
+                c2.download_button("📥 Export Debits", convert_df_to_csv(withdrawals_df), "Debits_Entries.csv", "text/csv")
+
                 c3.markdown(f"""
                     <div class="metric-card">
                         <div class="metric-label">Cash Deposited</div>
                         <div class="metric-value val-cash">₹{total_cash_deposit:,.2f}</div>
                     </div>
                 """, unsafe_allow_html=True)
-                
+                c3.download_button("📥 Export Cash", convert_df_to_csv(cash_df), "Cash_Deposits_Entries.csv", "text/csv")
+
                 c4.markdown(f"""
                     <div class="metric-card">
                         <div class="metric-label">Bank Charges</div>
                         <div class="metric-value val-charge">₹{total_charges:,.2f}</div>
                     </div>
                 """, unsafe_allow_html=True)
-                
+                c4.download_button("📥 Export Charges", convert_df_to_csv(charges_df), "Bank_Charges_Entries.csv", "text/csv")
+
                 c5.markdown(f"""
                     <div class="metric-card">
                         <div class="metric-label">OD Interest</div>
                         <div class="metric-value val-interest">₹{total_interest:,.2f}</div>
                     </div>
                 """, unsafe_allow_html=True)
+                if not daily_summary.empty:
+                    daily_exp = daily_summary[['Parsed_Date', 'Closing Balance', 'Utilized_OD_Amount', 'Daily_Interest']].copy()
+                    daily_exp['Parsed_Date'] = daily_exp['Parsed_Date'].dt.strftime('%d/%m/%Y')
+                    c5.download_button("📥 Export OD Ledger", convert_df_to_csv(daily_exp), "OD_Interest_Ledger.csv", "text/csv")
 
                 st.markdown("<br>", unsafe_allow_html=True)
 
-                # Export Excel Generation
+                # Export Complete Excel File
                 output_excel = "OD_Analysis_Report.xlsx"
                 with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
-                    export_df = filtered_df.drop(columns=['Parsed_Date'])
-                    export_df.to_excel(writer, sheet_name='Transactions', index=False)
+                    filtered_df.drop(columns=['Parsed_Date']).to_excel(writer, sheet_name='All_Transactions', index=False)
+                    deposits_df.to_excel(writer, sheet_name='Deposits_Only', index=False)
+                    withdrawals_df.to_excel(writer, sheet_name='Debits_Only', index=False)
+                    cash_df.to_excel(writer, sheet_name='Cash_Deposits', index=False)
+                    charges_df.to_excel(writer, sheet_name='Bank_Charges', index=False)
                     
                     if not daily_summary.empty:
                         summary_export = daily_summary[['Parsed_Date', 'Closing Balance', 'Utilized_OD_Amount', 'Daily_Interest']].copy()
@@ -364,28 +382,20 @@ if uploaded_file is not None:
                     overview_df.to_excel(writer, sheet_name='Executive_Summary', index=False)
                     
                     wb = writer.book
-                    format_excel_sheet(wb, 'Transactions')
-                    if not daily_summary.empty:
-                        format_excel_sheet(wb, 'Daily_OD_Interest')
-                    format_excel_sheet(wb, 'Executive_Summary')
+                    for sheet in wb.sheetnames:
+                        format_excel_sheet(wb, sheet)
 
-                # Download Bar Row
-                d_col1, d_col2 = st.columns([3, 1])
-                with d_col1:
-                    st.caption("ℹ️ Report reflects all filtered transactions and daily interest calculations.")
-                with d_col2:
-                    with open(output_excel, "rb") as fp:
-                        st.download_button(
-                            label="📥 Download Executive Report (.XLSX)",
-                            data=fp,
-                            file_name="OD_Executive_Report.xlsx",
-                            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                        )
+                st.sidebar.markdown("---")
+                with open(output_excel, "rb") as fp:
+                    st.sidebar.download_button(
+                        label="📊 Download Full Multi-Sheet Excel",
+                        data=fp,
+                        file_name="OD_Executive_Report.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
 
-                st.markdown("<br>", unsafe_allow_html=True)
-
-                # Modern Tabbed Interface
-                tab1, tab2, tab3 = st.tabs(["📋 Transactions Master", "📊 Daily OD Interest Ledger", "🏷️ Cash & Charge Audit"])
+                # Modern Tabbed Interface for Detailed Viewing
+                tab1, tab2, tab3, tab4 = st.tabs(["📋 Master Transactions", "📈 OD Interest Ledger", "💵 Cash Entries", "🏛️ Bank Charges"])
                 
                 with tab1:
                     show_df = filtered_df.drop(columns=['Parsed_Date'])
@@ -401,15 +411,12 @@ if uploaded_file is not None:
                         st.info("No OD calculations available for this period.")
                         
                 with tab3:
-                    sub1, sub2 = st.columns(2)
-                    with sub1:
-                        st.markdown("##### 💵 Cash Deposits Breakdown")
-                        cash_df = filtered_df[cash_mask & (filtered_df['Deposit Amt'] > 0)].drop(columns=['Parsed_Date'])
-                        st.dataframe(cash_df, use_container_width=True, height=350)
-                    with sub2:
-                        st.markdown("##### 🏛️ Detected Bank Fees & Charges")
-                        charges_df = filtered_df[charge_mask & (filtered_df['Withdrawal Amt'] > 0)].drop(columns=['Parsed_Date'])
-                        st.dataframe(charges_df, use_container_width=True, height=350)
+                    st.markdown("##### 💵 All Cash Deposit Entries")
+                    st.dataframe(cash_df, use_container_width=True, height=350)
+                    
+                with tab4:
+                    st.markdown("##### 🏛️ All Detected Bank Charges & Taxes")
+                    st.dataframe(charges_df, use_container_width=True, height=350)
 
     except Exception as e:
         err_msg = str(e).lower()
