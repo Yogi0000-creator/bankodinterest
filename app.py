@@ -7,7 +7,7 @@ from openpyxl.styles import Font, Alignment, PatternFill
 from openpyxl.utils import get_column_letter
 
 # Page Config
-st.set_page_config(page_title="Bank Statement OD Calculator", page_icon="📊", layout="centered")
+st.set_page_config(page_title="Advanced OD Interest & Statement Analyzer", page_icon="🏦", layout="wide")
 
 def parse_bank_statement_pdf_perfect(pdf_file):
     all_rows = []
@@ -97,12 +97,20 @@ def clean_number(val):
             return 0.0
     return 0.0
 
-def calculate_od_interest(df, od_limit, annual_interest_rate):
+def calculate_od_interest(df, od_limit, annual_interest_rate, start_date=None, end_date=None):
     df['Parsed_Date'] = pd.to_datetime(df['Value Dt'], format='%d/%m/%y', errors='coerce')
     df['Parsed_Date'] = df['Parsed_Date'].fillna(pd.to_datetime(df['Date'], format='%d/%m/%y', errors='coerce'))
     
     df = df.dropna(subset=['Parsed_Date']).sort_values(by='Parsed_Date').reset_index(drop=True)
     
+    # Date Range Filtering
+    if start_date and end_date:
+        df = df[(df['Parsed_Date'].dt.date >= start_date) & (df['Parsed_Date'].dt.date <= end_date)]
+    
+    if df.empty:
+        return df, pd.DataFrame()
+
+    # Day End Balance Calculation
     daily_df = df.groupby('Parsed_Date').last().reset_index()
     
     daily_df['Utilized_OD_Amount'] = od_limit - daily_df['Closing Balance']
@@ -130,7 +138,7 @@ def format_excel_sheet(workbook, sheet_name):
         ws.column_dimensions[col_letter].width = max(max_len + 4, 14)
 
         header_name = str(col[0].value)
-        if any(amt_key in header_name for amt_key in ["Amt", "Balance", "Amount", "Interest"]):
+        if any(amt_key in header_name for amt_key in ["Amt", "Balance", "Amount", "Interest", "Total"]):
             for cell in list(col)[1:]:
                 if isinstance(cell.value, (int, float)):
                     cell.number_format = '#,##0.00'
@@ -138,58 +146,142 @@ def format_excel_sheet(workbook, sheet_name):
 
 # ==================== STREAMLIT UI ====================
 
-st.title("🏦 Bank Statement OD Interest Calculator")
-st.write("PDF statement upload karein, OD limit aur interest rate set karke instant calculation dekhein.")
+st.title("🏦 Bank Statement OD & Financial Dashboard")
+st.write("Live Summary, Date-wise Interest Calculation, aur Custom Excel Export")
 
 st.divider()
 
-# Input Fields
-uploaded_file = st.file_uploader("Bank Statement PDF Upload Karein", type=["pdf"])
-
-col1, col2 = st.columns(2)
-with col1:
-    od_limit = st.number_input("OD Limit (INR)", value=1000000.0, step=50000.0, format="%.2f")
-with col2:
-    interest_rate = st.number_input("Interest Rate (% p.a.)", value=9.5, step=0.1, format="%.2f")
+# Sidebar Setup
+st.sidebar.header("⚙️ Settings & Inputs")
+uploaded_file = st.sidebar.file_uploader("Bank Statement PDF Upload", type=["pdf"])
+od_limit = st.sidebar.number_input("OD Limit (INR)", value=1000000.0, step=50000.0, format="%.2f")
+interest_rate = st.sidebar.number_input("Interest Rate (% p.a.)", value=9.5, step=0.1, format="%.2f")
 
 if uploaded_file is not None:
-    if st.button("Process & Calculate", type="primary", use_container_width=True):
-        with st.spinner("PDF process ho raha hai..."):
-            full_df = parse_bank_statement_pdf_perfect(uploaded_file)
+    # Initial Data Parse
+    raw_df = parse_bank_statement_pdf_perfect(uploaded_file)
+    
+    if raw_df.empty:
+        st.error("PDF se data read nahi ho saka. Format verify karein.")
+    else:
+        # Date Conversion for Filter
+        raw_df['Parsed_Date'] = pd.to_datetime(raw_df['Value Dt'], format='%d/%m/%y', errors='coerce')
+        raw_df['Parsed_Date'] = raw_df['Parsed_Date'].fillna(pd.to_datetime(raw_df['Date'], format='%d/%m/%y', errors='coerce'))
+        raw_df = raw_df.dropna(subset=['Parsed_Date']).sort_values(by='Parsed_Date').reset_index(drop=True)
+        
+        min_date = raw_df['Parsed_Date'].min().date()
+        max_date = raw_df['Parsed_Date'].max().date()
+        
+        st.sidebar.subheader("📅 Filter Date Range")
+        date_range = st.sidebar.date_input("Select Range", value=(min_date, max_date), min_value=min_date, max_value=max_date)
+        
+        start_date, end_date = None, None
+        if isinstance(date_range, tuple) and len(date_range) == 2:
+            start_date, end_date = date_range[0], date_range[1]
+        
+        # Calculate OD & Filtered Data
+        filtered_df, daily_summary = calculate_od_interest(raw_df, od_limit, interest_rate, start_date, end_date)
+        
+        if filtered_df.empty:
+            st.warning("Selected Date Range me koi transactions nahi hain.")
+        else:
+            # Financial Metrics Summary
+            total_withdrawal = filtered_df['Withdrawal Amt'].sum()
+            total_deposit = filtered_df['Deposit Amt'].sum()
             
-            if full_df.empty:
-                st.error("PDF se transactions extract nahi ho sake. File format check karein.")
-            else:
-                full_df, daily_summary = calculate_od_interest(full_df, od_limit, interest_rate)
-                total_interest = daily_summary['Daily_Interest'].sum()
+            # Cash Deposits Calculation (Keywords match: CASH, CDM, CSH, etc.)
+            cash_mask = filtered_df['Narration'].str.contains(r'CASH|CDM|CSH|DEPOSIT BY CASH', case=False, na=False)
+            total_cash_deposit = filtered_df[cash_mask & (filtered_df['Deposit Amt'] > 0)]['Deposit Amt'].sum()
+            
+            # Charges Calculation (Keywords match: CHARGE, CHG, FEE, INT.COLL, SMS, TAX, GST)
+            charge_mask = filtered_df['Narration'].str.contains(r'CHARGE|CHG|FEE|INT\.COLL|TAX|GST|COMMISSION|PENALTY', case=False, na=False)
+            total_charges = filtered_df[charge_mask & (filtered_df['Withdrawal Amt'] > 0)]['Withdrawal Amt'].sum()
+            
+            total_interest = daily_summary['Daily_Interest'].sum() if not daily_summary.empty else 0.0
+
+            # ---------------- DISPLAY LIVE METRICS ----------------
+            st.subheader("📊 Live Statement Summary")
+            col1, col2, col3, col4, col5 = st.columns(5)
+            
+            col1.metric("Total Deposits (Credit)", f"₹{total_deposit:,.2f}")
+            col2.metric("Total Withdrawals (Debit)", f"₹{total_withdrawal:,.2f}")
+            col3.metric("Total Cash Deposited", f"₹{total_cash_deposit:,.2f}")
+            col4.metric("Bank Charges / Fees", f"₹{total_charges:,.2f}")
+            col5.metric("Calculated OD Interest", f"₹{total_interest:,.2f}")
+
+            st.divider()
+
+            # ---------------- DOWNLOAD EXCEL BUTTON ----------------
+            output_excel = "OD_Analysis_Report.xlsx"
+            with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
+                # Sheet 1: Transactions
+                export_df = filtered_df.drop(columns=['Parsed_Date'])
+                export_df.to_excel(writer, sheet_name='Transactions', index=False)
                 
-                st.success(f"Calculated Total Interest: INR {total_interest:,.2f}")
-                
-                # Excel Generation in Memory
-                output_excel = "OD_Interest_Report.xlsx"
-                with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
-                    export_df = full_df.drop(columns=['Parsed_Date'])
-                    export_df.to_excel(writer, sheet_name='Transactions', index=False)
-                    
+                # Sheet 2: Daily OD Interest
+                if not daily_summary.empty:
                     summary_export = daily_summary[['Parsed_Date', 'Closing Balance', 'Utilized_OD_Amount', 'Daily_Interest']].copy()
                     summary_export['Parsed_Date'] = summary_export['Parsed_Date'].dt.strftime('%d/%m/%Y')
                     summary_export.columns = ['Date', 'Closing Balance', 'Utilized OD Amount', 'Daily Interest (INR)']
                     summary_export.to_excel(writer, sheet_name='Daily_OD_Interest', index=False)
-                    
-                    wb = writer.book
-                    format_excel_sheet(wb, 'Transactions')
+                
+                # Sheet 3: Financial Summary Card
+                overview_df = pd.DataFrame([
+                    {"Metric": "Selected Start Date", "Value": str(start_date)},
+                    {"Metric": "Selected End Date", "Value": str(end_date)},
+                    {"Metric": "OD Limit", "Value": od_limit},
+                    {"Metric": "Interest Rate (%)", "Value": interest_rate},
+                    {"Metric": "Total Credits (Deposits)", "Value": total_deposit},
+                    {"Metric": "Total Debits (Withdrawals)", "Value": total_withdrawal},
+                    {"Metric": "Total Cash Deposited", "Value": total_cash_deposit},
+                    {"Metric": "Total Bank Charges", "Value": total_charges},
+                    {"Metric": "Total OD Interest Payable", "Value": total_interest}
+                ])
+                overview_df.to_excel(writer, sheet_name='Financial_Summary', index=False)
+                
+                wb = writer.book
+                format_excel_sheet(wb, 'Transactions')
+                if not daily_summary.empty:
                     format_excel_sheet(wb, 'Daily_OD_Interest')
+                format_excel_sheet(wb, 'Financial_Summary')
+
+            with open(output_excel, "rb") as fp:
+                st.download_button(
+                    label="📥 Download Detailed Excel Report",
+                    data=fp,
+                    file_name="OD_Analysis_Report.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                    type="primary"
+                )
+
+            # ---------------- TABS FOR DETAILED TABLES ----------------
+            tab1, tab2, tab3 = st.tabs(["📝 All Transactions", "📈 Daily Interest Calculation", "🧾 Charges & Cash Breakdown"])
+            
+            with tab1:
+                st.write("### Filtered Transactions")
+                show_df = filtered_df.drop(columns=['Parsed_Date'])
+                st.dataframe(show_df, use_container_width=True)
                 
-                with open(output_excel, "rb") as fp:
-                    st.download_button(
-                        label="📥 Download Excel Report",
-                        data=fp,
-                        file_name="OD_Interest_Report.xlsx",
-                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                        use_container_width=True
-                    )
-                
-                st.subheader("Daily Interest Summary Preview")
-                preview_df = daily_summary[['Parsed_Date', 'Closing Balance', 'Utilized_OD_Amount', 'Daily_Interest']].copy()
-                preview_df['Parsed_Date'] = preview_df['Parsed_Date'].dt.strftime('%d/%m/%Y')
-                st.dataframe(preview_df, use_container_width=True)
+            with tab2:
+                st.write("### Day-wise OD Interest Breakdown")
+                if not daily_summary.empty:
+                    disp_daily = daily_summary[['Parsed_Date', 'Closing Balance', 'Utilized_OD_Amount', 'Daily_Interest']].copy()
+                    disp_daily['Parsed_Date'] = disp_daily['Parsed_Date'].dt.strftime('%d/%m/%Y')
+                    disp_daily.columns = ['Date', 'Closing Balance', 'Utilized OD Amount', 'Daily Interest (INR)']
+                    st.dataframe(disp_daily, use_container_width=True)
+                else:
+                    st.info("No OD calculations available for this range.")
+                    
+            with tab3:
+                c1, c2 = st.columns(2)
+                with c1:
+                    st.write("### Cash Deposit Transactions")
+                    cash_df = filtered_df[cash_mask & (filtered_df['Deposit Amt'] > 0)].drop(columns=['Parsed_Date'])
+                    st.dataframe(cash_df, use_container_width=True)
+                with c2:
+                    st.write("### Detected Bank Charges / Taxes")
+                    charges_df = filtered_df[charge_mask & (filtered_df['Withdrawal Amt'] > 0)].drop(columns=['Parsed_Date'])
+                    st.dataframe(charges_df, use_container_width=True)
+
+else:
+    st.info("👈 Please upload a Bank Statement PDF file from the sidebar to view live dashboard.")
