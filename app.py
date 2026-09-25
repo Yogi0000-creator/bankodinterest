@@ -272,7 +272,6 @@ od_limit = st.sidebar.number_input("Sanctioned OD Limit (₹)", value=15000000.0
 st.sidebar.markdown("---")
 st.sidebar.markdown("### 📈 Multi-Date Interest Rates Slabs")
 
-# Session state initialization for dynamic interest slabs
 if 'num_slabs' not in st.session_state:
     st.session_state.num_slabs = 1
 
@@ -332,7 +331,10 @@ if uploaded_file is not None:
                 deposits_df = filtered_df[filtered_df['Deposit Amt'] > 0].drop(columns=['Parsed_Date', 'Is_Interest_Entry'], errors='ignore')
                 withdrawals_df = filtered_df[filtered_df['Withdrawal Amt'] > 0].drop(columns=['Parsed_Date', 'Is_Interest_Entry'], errors='ignore')
                 
-                cash_mask = filtered_df['Narration'].str.contains(r'CASH|CDM|CSH|DEPOSIT BY CASH', case=False, na=False)
+                # STRICT CASH FILTER: Exclude CASHFREE and match physical cash patterns
+                cash_pattern = r'CASH\b|BY\s+CASH|CDM|CSH'
+                cash_mask = filtered_df['Narration'].str.contains(cash_pattern, case=False, na=False) & \
+                            ~filtered_df['Narration'].str.contains(r'CASHFREE', case=False, na=False)
                 cash_df = filtered_df[cash_mask & (filtered_df['Deposit Amt'] > 0)].drop(columns=['Parsed_Date', 'Is_Interest_Entry'], errors='ignore')
                 
                 charge_mask = filtered_df['Narration'].str.contains(r'CHARGE|CHG|FEE|TAX|GST|COMMISSION|PENALTY', case=False, na=False)
