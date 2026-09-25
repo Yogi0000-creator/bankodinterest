@@ -154,6 +154,16 @@ def is_interest_entry(narration):
         
     return False
 
+def is_cash_deposit(narration):
+    narr = str(narration).upper().replace(" ", "").replace("-", "")
+    # Exclude online Cashfree payment gateways
+    if "CASHFREE" in narr:
+        return False
+    # Match physical cash keywords
+    if "CASH" in narr or "CDM" in narr or "CSH" in narr or "BYCASH" in narr:
+        return True
+    return False
+
 def calculate_od_interest_multirate(df, od_limit, rate_slabs, start_date=None, end_date=None):
     df['Parsed_Date'] = pd.to_datetime(df['Value Dt'], format='%d/%m/%y', errors='coerce')
     df['Parsed_Date'] = df['Parsed_Date'].fillna(pd.to_datetime(df['Date'], format='%d/%m/%y', errors='coerce'))
@@ -331,14 +341,12 @@ if uploaded_file is not None:
                 deposits_df = filtered_df[filtered_df['Deposit Amt'] > 0].drop(columns=['Parsed_Date', 'Is_Interest_Entry'], errors='ignore')
                 withdrawals_df = filtered_df[filtered_df['Withdrawal Amt'] > 0].drop(columns=['Parsed_Date', 'Is_Interest_Entry'], errors='ignore')
                 
-                # STRICT CASH FILTER: Exclude CASHFREE and match physical cash patterns
-                cash_pattern = r'CASH\b|BY\s+CASH|CDM|CSH'
-                cash_mask = filtered_df['Narration'].str.contains(cash_pattern, case=False, na=False) & \
-                            ~filtered_df['Narration'].str.contains(r'CASHFREE', case=False, na=False)
-                cash_df = filtered_df[cash_mask & (filtered_df['Deposit Amt'] > 0)].drop(columns=['Parsed_Date', 'Is_Interest_Entry'], errors='ignore')
+                # Robust Cash Deposit Function Matching
+                filtered_df['Is_Cash_Deposit'] = filtered_df['Narration'].apply(is_cash_deposit)
+                cash_df = filtered_df[filtered_df['Is_Cash_Deposit'] & (filtered_df['Deposit Amt'] > 0)].drop(columns=['Parsed_Date', 'Is_Interest_Entry', 'Is_Cash_Deposit'], errors='ignore')
                 
                 charge_mask = filtered_df['Narration'].str.contains(r'CHARGE|CHG|FEE|TAX|GST|COMMISSION|PENALTY', case=False, na=False)
-                charges_df = filtered_df[charge_mask & (filtered_df['Withdrawal Amt'] > 0)].drop(columns=['Parsed_Date', 'Is_Interest_Entry'], errors='ignore')
+                charges_df = filtered_df[charge_mask & (filtered_df['Withdrawal Amt'] > 0)].drop(columns=['Parsed_Date', 'Is_Interest_Entry', 'Is_Cash_Deposit'], errors='ignore')
 
                 total_withdrawal = filtered_df['Withdrawal Amt'].sum()
                 total_deposit = filtered_df['Deposit Amt'].sum()
@@ -369,11 +377,11 @@ if uploaded_file is not None:
 
                 output_excel = "OD_Analysis_Report.xlsx"
                 with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
-                    filtered_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry'], errors='ignore').to_excel(writer, sheet_name='All_Transactions', index=False)
+                    filtered_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry', 'Is_Cash_Deposit'], errors='ignore').to_excel(writer, sheet_name='All_Transactions', index=False)
                     monthly_report.to_excel(writer, sheet_name='Monthly_Interest_Audit', index=False)
                     
                     if not bank_int_df.empty:
-                        bank_int_export = bank_int_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry', 'Year_Month'], errors='ignore')
+                        bank_int_export = bank_int_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry', 'Is_Cash_Deposit', 'Year_Month'], errors='ignore')
                         bank_int_export.to_excel(writer, sheet_name='Bank_Interest_Entries', index=False)
 
                     if not daily_summary.empty:
@@ -429,14 +437,14 @@ if uploaded_file is not None:
                 with tab2:
                     st.markdown("### 🔍 Verified Bank Interest Debited Entries")
                     if not bank_int_df.empty:
-                        disp_bank_int = bank_int_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry', 'Year_Month'], errors='ignore')
+                        disp_bank_int = bank_int_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry', 'Is_Cash_Deposit', 'Year_Month'], errors='ignore')
                         st.dataframe(disp_bank_int, use_container_width=True)
                         st.download_button("📥 Download Bank Interest Entries CSV", convert_df_to_csv(disp_bank_int), "Bank_Interest_Entries.csv", "text/csv")
                     else:
                         st.info("No bank interest debit entries found.")
 
                 with tab3:
-                    st.dataframe(filtered_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry'], errors='ignore'), use_container_width=True, height=420)
+                    st.dataframe(filtered_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry', 'Is_Cash_Deposit'], errors='ignore'), use_container_width=True, height=420)
                     
                 with tab4:
                     if not daily_summary.empty:
