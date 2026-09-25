@@ -127,7 +127,11 @@ def parse_bank_statement_pdf_perfect(pdf_file, password=None):
                     "Closing Balance": clean_number(balance_str)
                 })
 
-    return pd.DataFrame(all_rows)
+    df = pd.DataFrame(all_rows)
+    if not df.empty:
+        # Original sequence tracking for accurate day-end balance selection
+        df['Original_Order'] = df.index
+    return df
 
 def is_interest_entry(narration):
     narr = str(narration).upper()
@@ -156,10 +160,8 @@ def is_interest_entry(narration):
 
 def is_cash_deposit(narration):
     narr = str(narration).upper().replace(" ", "").replace("-", "")
-    # Exclude online Cashfree payment gateways
     if "CASHFREE" in narr:
         return False
-    # Match physical cash keywords
     if "CASH" in narr or "CDM" in narr or "CSH" in narr or "BYCASH" in narr:
         return True
     return False
@@ -167,18 +169,23 @@ def is_cash_deposit(narration):
 def calculate_od_interest_multirate(df, od_limit, rate_slabs, start_date=None, end_date=None):
     df['Parsed_Date'] = pd.to_datetime(df['Value Dt'], format='%d/%m/%y', errors='coerce')
     df['Parsed_Date'] = df['Parsed_Date'].fillna(pd.to_datetime(df['Date'], format='%d/%m/%y', errors='coerce'))
-    df = df.dropna(subset=['Parsed_Date']).sort_values(by='Parsed_Date').reset_index(drop=True)
+    df = df.dropna(subset=['Parsed_Date']).reset_index(drop=True)
     
+    # Filter Date Range
     if start_date and end_date:
         df = df[(df['Parsed_Date'].dt.date >= start_date) & (df['Parsed_Date'].dt.date <= end_date)]
     
     if df.empty:
         return df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
-    # 1. Daily Last Balance
-    daily_last = df.groupby('Parsed_Date')['Closing Balance'].last().reset_index()
-    
-    # 2. Continuous Date Range
+    # Sort strictly by Parsed_Date and Original_Order to maintain exact transaction order
+    df = df.sort_values(by=['Parsed_Date', 'Original_Order']).reset_index(drop=True)
+
+    # 1. Exact Day-End Balance: Take the LAST entry of each date according to Original_Order
+    idx_last = df.groupby('Parsed_Date')['Original_Order'].idxmax()
+    daily_last = df.loc[idx_last, ['Parsed_Date', 'Closing Balance']].reset_index(drop=True)
+
+    # 2. Continuous Date Range Fill
     full_date_range = pd.date_range(start=daily_last['Parsed_Date'].min(), end=daily_last['Parsed_Date'].max(), freq='D')
     daily_df = pd.DataFrame({'Parsed_Date': full_date_range})
     daily_df = pd.merge(daily_df, daily_last, on='Parsed_Date', how='left')
@@ -318,7 +325,7 @@ if uploaded_file is not None:
         else:
             raw_df['Parsed_Date'] = pd.to_datetime(raw_df['Value Dt'], format='%d/%m/%y', errors='coerce')
             raw_df['Parsed_Date'] = raw_df['Parsed_Date'].fillna(pd.to_datetime(raw_df['Date'], format='%d/%m/%y', errors='coerce'))
-            raw_df = raw_df.dropna(subset=['Parsed_Date']).sort_values(by='Parsed_Date').reset_index(drop=True)
+            raw_df = raw_df.dropna(subset=['Parsed_Date']).reset_index(drop=True)
             
             min_date = raw_df['Parsed_Date'].min().date()
             max_date = raw_df['Parsed_Date'].max().date()
@@ -338,15 +345,15 @@ if uploaded_file is not None:
             if filtered_df.empty:
                 st.warning("No transactions found in selected date range.")
             else:
-                deposits_df = filtered_df[filtered_df['Deposit Amt'] > 0].drop(columns=['Parsed_Date', 'Is_Interest_Entry'], errors='ignore')
-                withdrawals_df = filtered_df[filtered_df['Withdrawal Amt'] > 0].drop(columns=['Parsed_Date', 'Is_Interest_Entry'], errors='ignore')
+                clean_export_df = filtered_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry', 'Original_Order'], errors='ignore')
+                deposits_df = clean_export_df[clean_export_df['Deposit Amt'] > 0]
+                withdrawals_df = clean_export_df[clean_export_df['Withdrawal Amt'] > 0]
                 
-                # Robust Cash Deposit Function Matching
                 filtered_df['Is_Cash_Deposit'] = filtered_df['Narration'].apply(is_cash_deposit)
-                cash_df = filtered_df[filtered_df['Is_Cash_Deposit'] & (filtered_df['Deposit Amt'] > 0)].drop(columns=['Parsed_Date', 'Is_Interest_Entry', 'Is_Cash_Deposit'], errors='ignore')
+                cash_df = filtered_df[filtered_df['Is_Cash_Deposit'] & (filtered_df['Deposit Amt'] > 0)].drop(columns=['Parsed_Date', 'Is_Interest_Entry', 'Is_Cash_Deposit', 'Original_Order'], errors='ignore')
                 
                 charge_mask = filtered_df['Narration'].str.contains(r'CHARGE|CHG|FEE|TAX|GST|COMMISSION|PENALTY', case=False, na=False)
-                charges_df = filtered_df[charge_mask & (filtered_df['Withdrawal Amt'] > 0)].drop(columns=['Parsed_Date', 'Is_Interest_Entry', 'Is_Cash_Deposit'], errors='ignore')
+                charges_df = filtered_df[charge_mask & (filtered_df['Withdrawal Amt'] > 0)].drop(columns=['Parsed_Date', 'Is_Interest_Entry', 'Is_Cash_Deposit', 'Original_Order'], errors='ignore')
 
                 total_withdrawal = filtered_df['Withdrawal Amt'].sum()
                 total_deposit = filtered_df['Deposit Amt'].sum()
@@ -377,11 +384,11 @@ if uploaded_file is not None:
 
                 output_excel = "OD_Analysis_Report.xlsx"
                 with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
-                    filtered_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry', 'Is_Cash_Deposit'], errors='ignore').to_excel(writer, sheet_name='All_Transactions', index=False)
+                    clean_export_df.to_excel(writer, sheet_name='All_Transactions', index=False)
                     monthly_report.to_excel(writer, sheet_name='Monthly_Interest_Audit', index=False)
                     
                     if not bank_int_df.empty:
-                        bank_int_export = bank_int_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry', 'Is_Cash_Deposit', 'Year_Month'], errors='ignore')
+                        bank_int_export = bank_int_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry', 'Is_Cash_Deposit', 'Year_Month', 'Original_Order'], errors='ignore')
                         bank_int_export.to_excel(writer, sheet_name='Bank_Interest_Entries', index=False)
 
                     if not daily_summary.empty:
@@ -437,14 +444,14 @@ if uploaded_file is not None:
                 with tab2:
                     st.markdown("### 🔍 Verified Bank Interest Debited Entries")
                     if not bank_int_df.empty:
-                        disp_bank_int = bank_int_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry', 'Is_Cash_Deposit', 'Year_Month'], errors='ignore')
+                        disp_bank_int = bank_int_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry', 'Is_Cash_Deposit', 'Year_Month', 'Original_Order'], errors='ignore')
                         st.dataframe(disp_bank_int, use_container_width=True)
                         st.download_button("📥 Download Bank Interest Entries CSV", convert_df_to_csv(disp_bank_int), "Bank_Interest_Entries.csv", "text/csv")
                     else:
                         st.info("No bank interest debit entries found.")
 
                 with tab3:
-                    st.dataframe(filtered_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry', 'Is_Cash_Deposit'], errors='ignore'), use_container_width=True, height=420)
+                    st.dataframe(clean_export_df, use_container_width=True, height=420)
                     
                 with tab4:
                     if not daily_summary.empty:
