@@ -128,6 +128,31 @@ def parse_bank_statement_pdf_perfect(pdf_file, password=None):
 
     return pd.DataFrame(all_rows)
 
+def is_interest_entry(narration):
+    narr = str(narration).upper()
+    exclude_keywords = ['INT TRF', 'INT.TRF', 'INTERNAL', 'INTERCITY', 'INTEGRATED', 'TRANSFER', 'NEFT', 'RTGS', 'UPI']
+    for ex in exclude_keywords:
+        if ex in narr and 'DEBITED' not in narr and 'INTEREST' not in narr:
+            return False
+            
+    interest_patterns = [
+        r'INTEREST\s+DEBITED',
+        r'INTEREST\s+CHARGED',
+        r'INT\.?\s*COLL',
+        r'OD\s+INTEREST',
+        r'INTEREST\s+DRAWDOWN',
+        r'COMPOUND\s+INTEREST',
+        r'PENAL\s+INTEREST'
+    ]
+    for pattern in interest_patterns:
+        if re.search(pattern, narr):
+            return True
+            
+    if 'INTEREST' in narr and ('DEBIT' in narr or 'COLL' in narr or 'CHARGE' in narr):
+        return True
+        
+    return False
+
 def calculate_od_interest(df, od_limit, annual_interest_rate, start_date=None, end_date=None):
     df['Parsed_Date'] = pd.to_datetime(df['Value Dt'], format='%d/%m/%y', errors='coerce')
     df['Parsed_Date'] = df['Parsed_Date'].fillna(pd.to_datetime(df['Date'], format='%d/%m/%y', errors='coerce'))
@@ -137,7 +162,7 @@ def calculate_od_interest(df, od_limit, annual_interest_rate, start_date=None, e
         df = df[(df['Parsed_Date'].dt.date >= start_date) & (df['Parsed_Date'].dt.date <= end_date)]
     
     if df.empty:
-        return df, pd.DataFrame(), pd.DataFrame()
+        return df, pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
 
     # 1. Daily Last Balance
     daily_last = df.groupby('Parsed_Date')['Closing Balance'].last().reset_index()
@@ -158,15 +183,12 @@ def calculate_od_interest(df, od_limit, annual_interest_rate, start_date=None, e
     monthly_calc = daily_df.groupby('Year_Month')['Daily_Interest'].sum().reset_index()
     monthly_calc.rename(columns={'Daily_Interest': 'Calculated Interest (System)'}, inplace=True)
 
-    # 5. Extract Actual Bank Charged Interest (Enhanced Matching & Smart Month Mapping)
-    int_pattern = r'INT|INTEREST|INT\.COLL|INTEREST DEBITED|INT DEBIT|OD INT'
-    int_mask = df['Narration'].str.contains(int_pattern, case=False, na=False)
-    
-    bank_int_df = df[int_mask & (df['Withdrawal Amt'] > 0)].copy()
+    # 5. Extract Actual Bank Charged Interest (Strict Match)
+    df['Is_Interest_Entry'] = df['Narration'].apply(is_interest_entry)
+    bank_int_df = df[df['Is_Interest_Entry'] & (df['Withdrawal Amt'] > 0)].copy()
 
     def get_target_month(row):
         narration = str(row['Narration']).upper()
-        # Look for month references in narration (e.g. "TILL 31-AUG-2026")
         match = re.search(r'(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)[a-zA-Z]*[\s\-]*(20\d{2}|\d{2})', narration)
         if match:
             month_str = match.group(1)
@@ -192,7 +214,7 @@ def calculate_od_interest(df, od_limit, annual_interest_rate, start_date=None, e
     monthly_report['Month'] = monthly_report['Year_Month'].astype(str)
     monthly_report = monthly_report[['Month', 'Calculated Interest (System)', 'Bank Charged Interest (Actual)', 'Difference (Excess/Short)']]
 
-    return df, daily_df, monthly_report
+    return df, daily_df, monthly_report, bank_int_df
 
 def format_excel_sheet(workbook, sheet_name):
     ws = workbook[sheet_name]
@@ -223,7 +245,7 @@ def convert_df_to_csv(df):
 st.markdown("""
     <div class="header-container">
         <div class="header-title">💼 Financial Statement & OD Analytics</div>
-        <div class="header-subtitle">Automated Bank Statement Audit, Interest Computation & Monthly Reconciliation</div>
+        <div class="header-subtitle">Automated Bank Statement Audit, Interest Computation & Category Exports</div>
     </div>
 """, unsafe_allow_html=True)
 
@@ -258,19 +280,19 @@ if uploaded_file is not None:
             if isinstance(date_range, tuple) and len(date_range) == 2:
                 start_date, end_date = date_range[0], date_range[1]
             
-            filtered_df, daily_summary, monthly_report = calculate_od_interest(raw_df, od_limit, interest_rate, start_date, end_date)
+            filtered_df, daily_summary, monthly_report, bank_int_df = calculate_od_interest(raw_df, od_limit, interest_rate, start_date, end_date)
             
             if filtered_df.empty:
                 st.warning("No transactions found in selected date range.")
             else:
-                deposits_df = filtered_df[filtered_df['Deposit Amt'] > 0].drop(columns=['Parsed_Date'])
-                withdrawals_df = filtered_df[filtered_df['Withdrawal Amt'] > 0].drop(columns=['Parsed_Date'])
+                deposits_df = filtered_df[filtered_df['Deposit Amt'] > 0].drop(columns=['Parsed_Date', 'Is_Interest_Entry'])
+                withdrawals_df = filtered_df[filtered_df['Withdrawal Amt'] > 0].drop(columns=['Parsed_Date', 'Is_Interest_Entry'])
                 
                 cash_mask = filtered_df['Narration'].str.contains(r'CASH|CDM|CSH|DEPOSIT BY CASH', case=False, na=False)
-                cash_df = filtered_df[cash_mask & (filtered_df['Deposit Amt'] > 0)].drop(columns=['Parsed_Date'])
+                cash_df = filtered_df[cash_mask & (filtered_df['Deposit Amt'] > 0)].drop(columns=['Parsed_Date', 'Is_Interest_Entry'])
                 
-                charge_mask = filtered_df['Narration'].str.contains(r'CHARGE|CHG|FEE|INT\.COLL|TAX|GST|COMMISSION|PENALTY', case=False, na=False)
-                charges_df = filtered_df[charge_mask & (filtered_df['Withdrawal Amt'] > 0)].drop(columns=['Parsed_Date'])
+                charge_mask = filtered_df['Narration'].str.contains(r'CHARGE|CHG|FEE|TAX|GST|COMMISSION|PENALTY', case=False, na=False)
+                charges_df = filtered_df[charge_mask & (filtered_df['Withdrawal Amt'] > 0)].drop(columns=['Parsed_Date', 'Is_Interest_Entry'])
 
                 total_withdrawal = filtered_df['Withdrawal Amt'].sum()
                 total_deposit = filtered_df['Deposit Amt'].sum()
@@ -301,9 +323,13 @@ if uploaded_file is not None:
 
                 output_excel = "OD_Analysis_Report.xlsx"
                 with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
-                    filtered_df.drop(columns=['Parsed_Date']).to_excel(writer, sheet_name='All_Transactions', index=False)
+                    filtered_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry']).to_excel(writer, sheet_name='All_Transactions', index=False)
                     monthly_report.to_excel(writer, sheet_name='Monthly_Interest_Audit', index=False)
                     
+                    if not bank_int_df.empty:
+                        bank_int_export = bank_int_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry', 'Year_Month'], errors='ignore')
+                        bank_int_export.to_excel(writer, sheet_name='Bank_Interest_Entries', index=False)
+
                     if not daily_summary.empty:
                         summary_export = daily_summary[['Parsed_Date', 'Closing Balance', 'Utilized_OD_Amount', 'Daily_Interest']].copy()
                         summary_export['Parsed_Date'] = summary_export['Parsed_Date'].dt.strftime('%d/%m/%Y')
@@ -328,12 +354,13 @@ if uploaded_file is not None:
                         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
                     )
 
-                tab1, tab2, tab3, tab4, tab5 = st.tabs([
+                tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
                     "📊 Monthly Interest Audit", 
+                    "🏛️ Detected Bank Interest Entries",
                     "📋 Master Transactions", 
                     "📈 Daily OD Ledger", 
                     "💵 Cash Entries", 
-                    "🏛️ Bank Charges"
+                    "🧾 Bank Charges"
                 ])
                 
                 with tab1:
@@ -354,20 +381,33 @@ if uploaded_file is not None:
                     )
 
                 with tab2:
-                    st.dataframe(filtered_df.drop(columns=['Parsed_Date']), use_container_width=True, height=420)
-                    
+                    st.markdown("### 🔍 Verified Bank Interest Debited Entries")
+                    if not bank_int_df.empty:
+                        disp_bank_int = bank_int_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry', 'Year_Month'], errors='ignore')
+                        st.dataframe(disp_bank_int, use_container_width=True)
+                        st.download_button("📥 Download Bank Interest Entries CSV", convert_df_to_csv(disp_bank_int), "Bank_Interest_Entries.csv", "text/csv")
+                    else:
+                        st.info("No bank interest debit entries found.")
+
                 with tab3:
+                    st.dataframe(filtered_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry']), use_container_width=True, height=420)
+                    
+                with tab4:
                     if not daily_summary.empty:
                         disp_daily = daily_summary[['Parsed_Date', 'Closing Balance', 'Utilized_OD_Amount', 'Daily_Interest']].copy()
                         disp_daily['Parsed_Date'] = disp_daily['Parsed_Date'].dt.strftime('%d/%m/%Y')
                         disp_daily.columns = ['Date', 'Closing Balance', 'Utilized OD Amount', 'Daily Interest (INR)']
                         st.dataframe(disp_daily, use_container_width=True, height=420)
                         
-                with tab4:
-                    st.dataframe(cash_df, use_container_width=True, height=350)
-                    
                 with tab5:
+                    st.markdown("### 💵 Cash Deposit Entries")
+                    st.dataframe(cash_df, use_container_width=True, height=350)
+                    st.download_button("📥 Download Cash Deposits CSV", convert_df_to_csv(cash_df), "Cash_Deposits.csv", "text/csv")
+                    
+                with tab6:
+                    st.markdown("### 🧾 Detected Bank Charges & Fees")
                     st.dataframe(charges_df, use_container_width=True, height=350)
+                    st.download_button("📥 Download Bank Charges CSV", convert_df_to_csv(charges_df), "Bank_Charges_Entries.csv", "text/csv")
 
     except Exception as e:
         st.error(f"Error processing document: {str(e)}")
