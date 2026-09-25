@@ -3,6 +3,7 @@ import re
 import pdfplumber
 import pandas as pd
 import streamlit as st
+from datetime import datetime
 from openpyxl.styles import Font, Alignment, PatternFill
 from openpyxl.utils import get_column_letter
 
@@ -153,7 +154,7 @@ def is_interest_entry(narration):
         
     return False
 
-def calculate_od_interest(df, od_limit, annual_interest_rate, start_date=None, end_date=None):
+def calculate_od_interest_multirate(df, od_limit, rate_slabs, start_date=None, end_date=None):
     df['Parsed_Date'] = pd.to_datetime(df['Value Dt'], format='%d/%m/%y', errors='coerce')
     df['Parsed_Date'] = df['Parsed_Date'].fillna(pd.to_datetime(df['Date'], format='%d/%m/%y', errors='coerce'))
     df = df.dropna(subset=['Parsed_Date']).sort_values(by='Parsed_Date').reset_index(drop=True)
@@ -173,17 +174,28 @@ def calculate_od_interest(df, od_limit, annual_interest_rate, start_date=None, e
     daily_df = pd.merge(daily_df, daily_last, on='Parsed_Date', how='left')
     daily_df['Closing Balance'] = daily_df['Closing Balance'].ffill()
 
-    # 3. Utilized Amount & Daily Interest Calculation
-    daily_df['Utilized_OD_Amount'] = daily_df['Closing Balance'].apply(lambda bal: abs(bal) if bal < 0 else 0.0)
-    daily_rate = (annual_interest_rate / 100.0) / 365.0
-    daily_df['Daily_Interest'] = daily_df['Utilized_OD_Amount'] * daily_rate
+    # 3. Dynamic Interest Rate Assignment Per Day
+    def get_applicable_rate(row_date):
+        c_date = row_date.date()
+        for slab in rate_slabs:
+            s_from = slab['from_date']
+            s_to = slab['to_date']
+            if s_from <= c_date <= s_to:
+                return slab['rate']
+        return rate_slabs[0]['rate'] if rate_slabs else 9.5
 
-    # 4. Monthly System Calculated Interest
+    daily_df['Applied_Rate'] = daily_df['Parsed_Date'].apply(get_applicable_rate)
+
+    # 4. Utilized Amount & Daily Interest Calculation
+    daily_df['Utilized_OD_Amount'] = daily_df['Closing Balance'].apply(lambda bal: abs(bal) if bal < 0 else 0.0)
+    daily_df['Daily_Interest'] = daily_df['Utilized_OD_Amount'] * ((daily_df['Applied_Rate'] / 100.0) / 365.0)
+
+    # 5. Monthly System Calculated Interest
     daily_df['Year_Month'] = daily_df['Parsed_Date'].dt.to_period('M')
     monthly_calc = daily_df.groupby('Year_Month')['Daily_Interest'].sum().reset_index()
     monthly_calc.rename(columns={'Daily_Interest': 'Calculated Interest (System)'}, inplace=True)
 
-    # 5. Extract Actual Bank Charged Interest (Strict Match)
+    # 6. Extract Actual Bank Charged Interest (Strict Match)
     df['Is_Interest_Entry'] = df['Narration'].apply(is_interest_entry)
     bank_int_df = df[df['Is_Interest_Entry'] & (df['Withdrawal Amt'] > 0)].copy()
 
@@ -207,7 +219,7 @@ def calculate_od_interest(df, od_limit, annual_interest_rate, start_date=None, e
     else:
         monthly_bank = pd.DataFrame(columns=['Year_Month', 'Bank Charged Interest (Actual)'])
 
-    # 6. Merge & Reconciliation
+    # 7. Merge & Reconciliation
     monthly_report = pd.merge(monthly_calc, monthly_bank, on='Year_Month', how='left').fillna(0.0)
     monthly_report['Difference (Excess/Short)'] = monthly_report['Bank Charged Interest (Actual)'] - monthly_report['Calculated Interest (System)']
     
@@ -232,10 +244,10 @@ def format_excel_sheet(workbook, sheet_name):
         ws.column_dimensions[col_letter].width = max(max_len + 5, 14)
 
         header_name = str(col[0].value)
-        if any(amt_key in header_name for amt_key in ["Amt", "Balance", "Amount", "Interest", "Total", "Difference"]):
+        if any(amt_key in header_name for amt_key in ["Amt", "Balance", "Amount", "Interest", "Total", "Difference", "Rate"]):
             for cell in list(col)[1:]:
                 if isinstance(cell.value, (int, float)):
-                    cell.number_format = '₹#,##0.00'
+                    cell.number_format = '₹#,##0.00' if "Rate" not in header_name else '0.00%'
                     cell.alignment = Alignment(horizontal="right")
 
 def convert_df_to_csv(df):
@@ -245,7 +257,7 @@ def convert_df_to_csv(df):
 st.markdown("""
     <div class="header-container">
         <div class="header-title">💼 Financial Statement & OD Analytics</div>
-        <div class="header-subtitle">Automated Bank Statement Audit, Interest Computation & Category Exports</div>
+        <div class="header-subtitle">Automated Bank Statement Audit, Multi-Rate Interest Computation & Category Exports</div>
     </div>
 """, unsafe_allow_html=True)
 
@@ -254,9 +266,39 @@ uploaded_file = st.sidebar.file_uploader("Upload Bank Statement (PDF)", type=["p
 pdf_password = st.sidebar.text_input("PDF Password (If Encrypted)", type="password")
 
 st.sidebar.markdown("---")
-st.sidebar.markdown("### 💰 Credit Limits & Rates")
+st.sidebar.markdown("### 💰 Credit Limit")
 od_limit = st.sidebar.number_input("Sanctioned OD Limit (₹)", value=15000000.0, step=100000.0, format="%.2f")
-interest_rate = st.sidebar.number_input("Interest Rate (% p.a.)", value=9.5, step=0.1, format="%.2f")
+
+st.sidebar.markdown("---")
+st.sidebar.markdown("### 📈 Multi-Date Interest Rates Slabs")
+
+# Session state initialization for dynamic interest slabs
+if 'num_slabs' not in st.session_state:
+    st.session_state.num_slabs = 1
+
+col_btn1, col_btn2 = st.sidebar.columns(2)
+if col_btn1.button("➕ Add Slab"):
+    st.session_state.num_slabs += 1
+if col_btn2.button("➖ Remove") and st.session_state.num_slabs > 1:
+    st.session_state.num_slabs -= 1
+
+rate_slabs = []
+for i in range(st.session_state.num_slabs):
+    st.sidebar.markdown(f"**Rate Slab {i+1}**")
+    s_col1, s_col2 = st.sidebar.columns(2)
+    
+    default_start = datetime(2025, 4, 1).date() if i == 0 else datetime(2025, 10, 1).date()
+    default_end = datetime(2026, 3, 31).date()
+    
+    f_date = s_col1.date_input(f"From (Slab {i+1})", value=default_start, key=f"from_{i}")
+    t_date = s_col2.date_input(f"To (Slab {i+1})", value=default_end, key=f"to_{i}")
+    rate_val = st.sidebar.number_input(f"Interest Rate % p.a. (Slab {i+1})", value=9.5, step=0.1, format="%.2f", key=f"rate_{i}")
+    
+    rate_slabs.append({
+        'from_date': f_date,
+        'to_date': t_date,
+        'rate': rate_val
+    })
 
 if uploaded_file is not None:
     try:
@@ -273,26 +315,28 @@ if uploaded_file is not None:
             max_date = raw_df['Parsed_Date'].max().date()
             
             st.sidebar.markdown("---")
-            st.sidebar.markdown("### 📅 Analysis Period")
+            st.sidebar.markdown("### 📅 Overall Statement Period")
             date_range = st.sidebar.date_input("Filter Dates", value=(min_date, max_date), min_value=min_date, max_value=max_date)
             
             start_date, end_date = None, None
             if isinstance(date_range, tuple) and len(date_range) == 2:
                 start_date, end_date = date_range[0], date_range[1]
             
-            filtered_df, daily_summary, monthly_report, bank_int_df = calculate_od_interest(raw_df, od_limit, interest_rate, start_date, end_date)
+            filtered_df, daily_summary, monthly_report, bank_int_df = calculate_od_interest_multirate(
+                raw_df, od_limit, rate_slabs, start_date, end_date
+            )
             
             if filtered_df.empty:
                 st.warning("No transactions found in selected date range.")
             else:
-                deposits_df = filtered_df[filtered_df['Deposit Amt'] > 0].drop(columns=['Parsed_Date', 'Is_Interest_Entry'])
-                withdrawals_df = filtered_df[filtered_df['Withdrawal Amt'] > 0].drop(columns=['Parsed_Date', 'Is_Interest_Entry'])
+                deposits_df = filtered_df[filtered_df['Deposit Amt'] > 0].drop(columns=['Parsed_Date', 'Is_Interest_Entry'], errors='ignore')
+                withdrawals_df = filtered_df[filtered_df['Withdrawal Amt'] > 0].drop(columns=['Parsed_Date', 'Is_Interest_Entry'], errors='ignore')
                 
                 cash_mask = filtered_df['Narration'].str.contains(r'CASH|CDM|CSH|DEPOSIT BY CASH', case=False, na=False)
-                cash_df = filtered_df[cash_mask & (filtered_df['Deposit Amt'] > 0)].drop(columns=['Parsed_Date', 'Is_Interest_Entry'])
+                cash_df = filtered_df[cash_mask & (filtered_df['Deposit Amt'] > 0)].drop(columns=['Parsed_Date', 'Is_Interest_Entry'], errors='ignore')
                 
                 charge_mask = filtered_df['Narration'].str.contains(r'CHARGE|CHG|FEE|TAX|GST|COMMISSION|PENALTY', case=False, na=False)
-                charges_df = filtered_df[charge_mask & (filtered_df['Withdrawal Amt'] > 0)].drop(columns=['Parsed_Date', 'Is_Interest_Entry'])
+                charges_df = filtered_df[charge_mask & (filtered_df['Withdrawal Amt'] > 0)].drop(columns=['Parsed_Date', 'Is_Interest_Entry'], errors='ignore')
 
                 total_withdrawal = filtered_df['Withdrawal Amt'].sum()
                 total_deposit = filtered_df['Deposit Amt'].sum()
@@ -315,7 +359,7 @@ if uploaded_file is not None:
 
                 c5.markdown(f'<div class="metric-card"><div class="metric-label">OD Interest</div><div class="metric-value val-interest">₹{total_interest:,.2f}</div></div>', unsafe_allow_html=True)
                 if not daily_summary.empty:
-                    daily_exp = daily_summary[['Parsed_Date', 'Closing Balance', 'Utilized_OD_Amount', 'Daily_Interest']].copy()
+                    daily_exp = daily_summary[['Parsed_Date', 'Closing Balance', 'Utilized_OD_Amount', 'Applied_Rate', 'Daily_Interest']].copy()
                     daily_exp['Parsed_Date'] = daily_exp['Parsed_Date'].dt.strftime('%d/%m/%Y')
                     c5.download_button("📥 Export Daily Ledger", convert_df_to_csv(daily_exp), "OD_Daily_Ledger.csv", "text/csv")
 
@@ -323,7 +367,7 @@ if uploaded_file is not None:
 
                 output_excel = "OD_Analysis_Report.xlsx"
                 with pd.ExcelWriter(output_excel, engine='openpyxl') as writer:
-                    filtered_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry']).to_excel(writer, sheet_name='All_Transactions', index=False)
+                    filtered_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry'], errors='ignore').to_excel(writer, sheet_name='All_Transactions', index=False)
                     monthly_report.to_excel(writer, sheet_name='Monthly_Interest_Audit', index=False)
                     
                     if not bank_int_df.empty:
@@ -331,9 +375,9 @@ if uploaded_file is not None:
                         bank_int_export.to_excel(writer, sheet_name='Bank_Interest_Entries', index=False)
 
                     if not daily_summary.empty:
-                        summary_export = daily_summary[['Parsed_Date', 'Closing Balance', 'Utilized_OD_Amount', 'Daily_Interest']].copy()
+                        summary_export = daily_summary[['Parsed_Date', 'Closing Balance', 'Utilized_OD_Amount', 'Applied_Rate', 'Daily_Interest']].copy()
                         summary_export['Parsed_Date'] = summary_export['Parsed_Date'].dt.strftime('%d/%m/%Y')
-                        summary_export.columns = ['Date', 'Closing Balance', 'Utilized OD Amount', 'Daily Interest (INR)']
+                        summary_export.columns = ['Date', 'Closing Balance', 'Utilized OD Amount', 'Applied Rate (%)', 'Daily Interest (INR)']
                         summary_export.to_excel(writer, sheet_name='Daily_OD_Ledger', index=False)
 
                     deposits_df.to_excel(writer, sheet_name='Deposits_Only', index=False)
@@ -390,13 +434,13 @@ if uploaded_file is not None:
                         st.info("No bank interest debit entries found.")
 
                 with tab3:
-                    st.dataframe(filtered_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry']), use_container_width=True, height=420)
+                    st.dataframe(filtered_df.drop(columns=['Parsed_Date', 'Is_Interest_Entry'], errors='ignore'), use_container_width=True, height=420)
                     
                 with tab4:
                     if not daily_summary.empty:
-                        disp_daily = daily_summary[['Parsed_Date', 'Closing Balance', 'Utilized_OD_Amount', 'Daily_Interest']].copy()
+                        disp_daily = daily_summary[['Parsed_Date', 'Closing Balance', 'Utilized_OD_Amount', 'Applied_Rate', 'Daily_Interest']].copy()
                         disp_daily['Parsed_Date'] = disp_daily['Parsed_Date'].dt.strftime('%d/%m/%Y')
-                        disp_daily.columns = ['Date', 'Closing Balance', 'Utilized OD Amount', 'Daily Interest (INR)']
+                        disp_daily.columns = ['Date', 'Closing Balance', 'Utilized OD Amount', 'Applied Rate (%)', 'Daily Interest (INR)']
                         st.dataframe(disp_daily, use_container_width=True, height=420)
                         
                 with tab5:
